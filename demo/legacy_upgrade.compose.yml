@@ -1,0 +1,20 @@
+services:
+  mirror:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: artifact-mirror:1.0.0
+    container_name: artifact-mirror-legacy-demo
+    ports:
+      - "18000:8000"
+    environment:
+      MIRROR_DB_PATH: /data/mirror.db
+    volumes:
+      - legacy-demo-data:/data
+      # The seed script is demo-only and is not baked into the production
+      # image, so mount it for the one-off seeder container.
+      - ./seed_legacy_db.py:/seed_legacy_db.py:ro
+    restart: "no"
+
+volumes:
+  legacy-demo-data:

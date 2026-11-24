@@ -19,7 +19,13 @@ The mirror must satisfy two properties that drive the design:
 docker compose up --build -d
 curl -s localhost:8000/status | jq .
 ./demo/demo.sh                 # out-of-order ingest, GC, resend
+./demo/legacy_upgrade.sh       # upgrade a pre-digest database, then resend
 ```
+
+`demo/legacy_upgrade.sh` uses its own Compose file and volume (port 18000), so
+it does not disturb the main demo. It seeds a database written by the previous
+schema, starts the current image (which migrates it on startup), and shows a
+verbatim resend, a content conflict, and two unverifiable legacy receipts.
 
 Without Docker:
 
@@ -39,7 +45,7 @@ python3 -m pytest -q
 
 | table       | meaning |
 |-------------|---------|
-| `receipts`  | one row per sequence number actually received, including ones superseded by a newer operation. Cleared by GC. |
+| `receipts`  | one row per sequence number actually received, including ones superseded by a newer operation. Carries the SHA-256 of the body as first received. Cleared by GC. |
 | `artifacts` | latest operation per path. `operation='publish'` serves bytes; `operation='delete'` is a tombstone that makes downloads 404. |
 | `meta`      | `gc_watermark` — every number ≤ the watermark has been reclaimed. |
 
@@ -70,8 +76,38 @@ Per-event result:
 | `status`          | meaning |
 |-------------------|---------|
 | `accepted`        | new receipt was stored. `applied` says whether it changed the download state; if not, `superseded_by` names the newer sequence in effect. |
-| `duplicate`       | that sequence number was already received; acknowledged only. |
-| `already_cleared` | the sequence number is at or below the GC watermark. Acknowledged only — never applied, so a late resend cannot resurrect a withdrawn package after a restart. |
+| `duplicate`       | that sequence number was already received; acknowledged only. See conflict fields below. |
+| `already_cleared` | the sequence number is at or below the GC watermark. Acknowledged only — never applied, so a late resend cannot resurrect a withdrawn package after a restart. Its comparison basis was reclaimed too, so `verification` is `not_available`. |
+
+#### Distinguishing a verbatim resend from the wrong package
+
+When a `duplicate` is a `publish` with the same path and operation, the mirror
+compares the submitted bytes against the SHA-256 captured when that sequence
+number was **first** received. This works whether the original package is
+still live, was superseded by a newer number, or was later withdrawn — the
+receipt keeps its own basis. The comparison is a fixed-size digest, so its cost
+does not grow with package size.
+
+| field               | meaning |
+|---------------------|---------|
+| `conflict`          | `true` = body differs from the original; `false` = identical body; `null` = cannot be verified. |
+| `content_verified`  | `true`/`false`/`null` mirroring the verification outcome. |
+| `verification`      | `match`, `mismatch`, `unverifiable`, `not_applicable` (delete), or `not_comparable` (path/operation differs). |
+| `original_sha256`   | digest recorded at first receipt (`null` when lost). |
+| `received_sha256`   | digest of the body in this resend. |
+
+The first write always wins: a mismatched or unverifiable resend is
+acknowledged but never replaces the original receipt or the served artifact.
+If an older database has a publish receipt whose original body was already lost
+(its package was superseded, replaced or withdrawn before the upgrade), the
+digest is absent. The receipt is reported as `verification="unverifiable"`, and
+the resend is **not** adopted as the new original, so the situation cannot be
+silently normalised. Receipts whose package is still the live artifact are
+backfilled automatically on startup.
+
+The digest is part of the receipt row: it is committed or rolled back with the
+same batch and deleted by GC along with the receipt. After a restart the same
+basis is used again.
 
 A batch is one SQLite transaction: either every receipt in it is stored, or
 none is.
@@ -125,6 +161,10 @@ POST /gc {"limit": 10} -> cleared [3, 4], tombstone for team/a.tgz reclaimed
 
 resend seq 2 (publish team/a.tgz) -> already_cleared, acknowledged only
 GET team/a.tgz -> 404 (still deleted)
+
+resend seq 5 (publish pkg/d.tgz, identical bytes) -> duplicate, conflict=false
+resend seq 5 (publish pkg/d.tgz, different bytes) -> duplicate, conflict=true
+withdraw pkg/d.tgz (seq 6), resend seq 5 with other bytes -> conflict=true, 404
 ```
 
 That last line is the key property: the tombstone row was reclaimed, yet the

@@ -365,3 +365,152 @@ def test_multiple_paths_in_one_batch_are_independent(client):
     catalog = client.get("/artifacts").json()
     assert [(a["path"], a["latest_seq"]) for a in catalog["artifacts"]] == [("a.tgz", 4)]
     assert client.get("/status").json()["receipt_count"] == 5
+
+
+# ---------------------------------------------------------------------------
+# Content-conflict detection on re-sent publish sequence numbers
+# ---------------------------------------------------------------------------
+
+
+def test_verbatim_resend_of_live_publish_is_not_a_conflict(client):
+    send(client, [publish(1, "a.tgz", b"v1")])
+    result = send(client, [publish(1, "a.tgz", b"v1")]).json()["results"][0]
+    assert result["status"] == "duplicate"
+    assert result["conflict"] is False
+    assert result["content_verified"] is True
+    assert result["verification"] == "match"
+    assert result["received_sha256"] == result["original_sha256"]
+    assert client.get("/artifacts/a.tgz").content == b"v1"
+
+
+def test_resend_with_different_body_is_a_conflict(client):
+    send(client, [publish(1, "a.tgz", b"original")])
+    result = send(client, [publish(1, "a.tgz", b"tampered")]).json()["results"][0]
+    assert result["status"] == "duplicate"
+    assert result["conflict"] is True
+    assert result["content_verified"] is False
+    assert result["verification"] == "mismatch"
+    assert result["original_sha256"] != result["received_sha256"]
+    # First write wins: the served bytes are still the original.
+    assert client.get("/artifacts/a.tgz").content == b"original"
+
+
+def test_conflict_detected_even_when_original_was_superseded(client):
+    send(client, [publish(1, "a.tgz", b"v1"), publish(2, "a.tgz", b"v2")])
+    same = send(client, [publish(1, "a.tgz", b"v1")]).json()["results"][0]
+    assert same["conflict"] is False
+    assert same["verification"] == "match"
+
+    wrong = send(client, [publish(1, "a.tgz", b"not-v1")]).json()["results"][0]
+    assert wrong["conflict"] is True
+    assert wrong["verification"] == "mismatch"
+    assert client.get("/artifacts/a.tgz").content == b"v2"
+
+
+def test_conflict_detected_even_after_the_package_was_withdrawn(client):
+    send(client, [publish(1, "a.tgz", b"v1"), delete(2, "a.tgz")])
+    wrong = send(client, [publish(1, "a.tgz", b"other")]).json()["results"][0]
+    assert wrong["status"] == "duplicate"
+    assert wrong["conflict"] is True
+    assert wrong["verification"] == "mismatch"
+    # Still withdrawn; the resend cannot bring anything back.
+    assert client.get("/artifacts/a.tgz").status_code == 404
+
+
+def test_conflict_detected_for_publish_that_never_became_live(client):
+    # seq 2 is older than the already-effective seq 5, so it is stored as a
+    # receipt but never applied.
+    send(client, [delete(5, "a.tgz"), publish(2, "a.tgz", b"v2")])
+    wrong = send(client, [publish(2, "a.tgz", b"different")]).json()["results"][0]
+    assert wrong["conflict"] is True
+    assert wrong["verification"] == "mismatch"
+
+
+def test_delete_duplicate_has_no_content_comparison(client):
+    send(client, [delete(1, "a.tgz")])
+    result = send(client, [delete(1, "a.tgz")]).json()["results"][0]
+    assert result["status"] == "duplicate"
+    assert result["conflict"] is False
+    assert result["verification"] == "not_applicable"
+
+
+def test_path_and_operation_conflict_behaviour_is_unchanged(client):
+    send(client, [publish(1, "a.tgz", b"v1")])
+    path_clash = send(client, [publish(1, "b.tgz", b"v1")]).json()["results"][0]
+    assert path_clash["conflict"] is True
+    assert path_clash["verification"] == "not_comparable"
+    assert path_clash["original_path"] == "a.tgz"
+
+    send(client, [delete(2, "c.tgz")])
+    op_clash = send(client, [publish(2, "c.tgz", b"v2")]).json()["results"][0]
+    assert op_clash["conflict"] is True
+    assert op_clash["verification"] == "not_comparable"
+    assert op_clash["original_operation"] == "delete"
+    # Neither clash is applied.
+    assert client.get("/artifacts/b.tgz").status_code == 404
+    assert client.get("/artifacts/c.tgz").status_code == 404
+
+
+def test_digest_survives_restart_and_still_detects_conflict(client, tmp_path):
+    send(client, [publish(1, "a.tgz", b"v1")])
+
+    for name in list(sys.modules):
+        if name == "app" or name.startswith("app."):
+            del sys.modules[name]
+    from app import main
+
+    with TestClient(main.app) as restarted:
+        ok = send(restarted, [publish(1, "a.tgz", b"v1")]).json()["results"][0]
+        assert ok["conflict"] is False
+        bad = send(restarted, [publish(1, "a.tgz", b"v2")]).json()["results"][0]
+        assert bad["conflict"] is True
+        assert bad["verification"] == "mismatch"
+
+
+def test_digest_is_reclaimed_with_the_receipt(client):
+    send(client, [publish(1, "a.tgz", b"v1")])
+    assert client.get("/events").json()["events"][0]["content_sha256"] is not None
+
+    gc = client.post("/gc", json={"limit": 10}).json()
+    assert gc["cleared"] == [1]
+    assert client.get("/events").json()["events"] == []
+
+    result = send(client, [publish(1, "a.tgz", b"totally-different")]).json()["results"][0]
+    assert result["status"] == "already_cleared"
+    assert result["conflict"] is None
+    assert result["verification"] == "not_available"
+    # The live package is untouched by the late resend.
+    assert client.get("/artifacts/a.tgz").content == b"v1"
+
+
+def test_receipt_digest_rolls_back_with_a_failed_batch(client, monkeypatch):
+    from app import db
+
+    send(client, [publish(1, "keep.tgz", b"keep")])
+
+    # Let both events insert in the transaction, then fail before COMMIT.
+    real = db._ingest_one
+    calls = {"n": 0}
+
+    def flaky(conn, event, watermark):
+        calls["n"] += 1
+        result = real(conn, event, watermark)
+        if calls["n"] == 2:
+            raise RuntimeError("simulated failure after staging receipts")
+        return result
+
+    monkeypatch.setattr(db, "_ingest_one", flaky)
+    r = send(
+        client,
+        [publish(2, "a.tgz", b"a"), publish(3, "b.tgz", b"b")],
+    )
+    assert r.status_code == 500
+    monkeypatch.undo()
+
+    # Neither the receipts nor their digests were committed.
+    events = client.get("/events").json()["events"]
+    assert [e["seq"] for e in events] == [1]
+    # A later, differently-bodied resend of seq 2 is accepted afresh.
+    result = send(client, [publish(2, "a.tgz", b"brand-new")]).json()["results"][0]
+    assert result["status"] == "accepted"
+    assert client.get("/artifacts/a.tgz").content == b"brand-new"

@@ -96,6 +96,37 @@ curl -sS -X POST "$BASE_URL/events" \
   -F 'manifest=[{"seq":5,"path":"pkg/d.tgz","operation":"publish","file":"f0"}]' \
   -F 'f0=@'"$WORK"'/b.tgz;filename=d.tgz' | jq .
 
-step "8. Final status and catalog"
+step "8. Content conflict: same seq/path, different bytes on a live package"
+# seq 5 is pkg/d.tgz (body b.tgz). A verbatim resend is a plain duplicate with
+# conflict=false ...
+curl -sS -X POST "$BASE_URL/events" \
+  -F 'manifest=[{"seq":5,"path":"pkg/d.tgz","operation":"publish","file":"f0"}]' \
+  -F 'f0=@'"$WORK"'/b.tgz;filename=d.tgz' | jq .
+hr
+# ... while the same sequence number and path carrying a different body is a
+# duplicate too, but flagged conflict=true. The first-received bytes stay live.
+printf 'package-d-WRONG' > "$WORK/d-wrong.tgz"
+curl -sS -X POST "$BASE_URL/events" \
+  -F 'manifest=[{"seq":5,"path":"pkg/d.tgz","operation":"publish","file":"f0"}]' \
+  -F 'f0=@'"$WORK"'/d-wrong.tgz;filename=d.tgz' | jq .
+hr
+printf 'GET /artifacts/pkg/d.tgz after wrong resend -> %s\n' \
+  "$(curl -sS "$BASE_URL/artifacts/pkg/d.tgz")"
+
+step "9. Content conflict is still detected after the package is withdrawn"
+# Withdraw pkg/d.tgz with seq 6, then resend seq 5 with yet another body. The
+# original digest is kept on the receipt, not in the artifact row.
+curl -sS -X POST "$BASE_URL/events" \
+  -F 'manifest=[{"seq":6,"path":"pkg/d.tgz","operation":"delete"}]' | jq .
+hr
+printf 'package-d-OTHER' > "$WORK/d-other.tgz"
+curl -sS -X POST "$BASE_URL/events" \
+  -F 'manifest=[{"seq":5,"path":"pkg/d.tgz","operation":"publish","file":"f0"}]' \
+  -F 'f0=@'"$WORK"'/d-other.tgz;filename=d.tgz' | jq .
+hr
+printf 'GET /artifacts/pkg/d.tgz after conflict resend -> %s (still deleted)\n' \
+  "$(curl -sS -o /dev/null -w '%{http_code}' "$BASE_URL/artifacts/pkg/d.tgz")"
+
+step "10. Final status and catalog"
 curl -sS "$BASE_URL/status" | jq .
 curl -sS "$BASE_URL/artifacts" | jq .

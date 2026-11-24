@@ -6,7 +6,11 @@ The database keeps three kinds of rows:
     One row per sequence number that has actually been received.  Receipts are
     deliberately kept even when a newer operation supersedes the operation
     carried by the row: they are the proof of receipt and are what lets GC know
-    that a prefix of the global sequence is complete.
+    that a prefix of the global sequence is complete.  A publish receipt also
+    carries a fixed-size SHA-256 digest of the body as it was first received,
+    so a later resend can be checked against the original rather than being
+    mistaken for an exact duplicate.  The digest lives and dies with the
+    receipt row: it is written in the same transaction and reclaimed by GC.
 
 ``artifacts``
     The latest operation per package path.  This is the read model used by
@@ -34,10 +38,11 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 
 CREATE TABLE IF NOT EXISTS receipts (
-    seq         INTEGER PRIMARY KEY,
-    path        TEXT NOT NULL,
-    operation   TEXT NOT NULL CHECK (operation IN ('publish', 'delete')),
-    received_at TEXT NOT NULL
+    seq            INTEGER PRIMARY KEY,
+    path           TEXT NOT NULL,
+    operation      TEXT NOT NULL CHECK (operation IN ('publish', 'delete')),
+    content_sha256 TEXT,
+    received_at    TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_receipts_path ON receipts(path);
@@ -87,11 +92,76 @@ def init_db(db_path: str | Path) -> None:
     try:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(SCHEMA)
+        _migrate_legacy_receipts(conn)
         conn.execute(
             "INSERT OR IGNORE INTO meta(key, value) VALUES ('gc_watermark', '0')"
         )
     finally:
         conn.close()
+
+
+# Backfill the digest for receipts written before the column existed.  The
+# only original body still available in an old database is the one held by the
+# artifact row for the same path *and* the same sequence number.  A receipt
+# that was superseded (or whose package was later replaced or withdrawn) has
+# lost its original body; its digest stays NULL and later resends of it are
+# reported as unverifiable rather than being accepted as the original.
+_BACKFILL_LEGACY_DIGESTS = """
+UPDATE receipts
+SET content_sha256 = (
+    SELECT artifacts.sha256
+    FROM artifacts
+    WHERE artifacts.path = receipts.path
+      AND artifacts.latest_seq = receipts.seq
+      AND artifacts.operation = 'publish'
+      AND artifacts.sha256 IS NOT NULL
+)
+WHERE receipts.operation = 'publish'
+  AND receipts.content_sha256 IS NULL
+  AND EXISTS (
+      SELECT 1
+      FROM artifacts
+      WHERE artifacts.path = receipts.path
+        AND artifacts.latest_seq = receipts.seq
+        AND artifacts.operation = 'publish'
+        AND artifacts.sha256 IS NOT NULL
+  )
+"""
+
+
+def _migrate_legacy_receipts(conn: sqlite3.Connection) -> None:
+    """Add the receipt digest column to an older database and backfill it.
+
+    The migration is idempotent and safe when several workers start at once:
+    the schema change runs in its own transaction, and a column added by
+    another process between our check and our ``ALTER`` is treated as done.
+    """
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(receipts)")
+        }
+        if "content_sha256" not in columns:
+            try:
+                conn.execute("ALTER TABLE receipts ADD COLUMN content_sha256 TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
+        conn.execute("COMMIT")
+    except BaseException:
+        _rollback_quietly(conn)
+        raise
+
+    # Backfill is a pure function of the stored rows, so it is safe to run
+    # again on every startup; it never overwrites a digest that exists.
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(_BACKFILL_LEGACY_DIGESTS)
+        conn.execute("COMMIT")
+    except BaseException:
+        _rollback_quietly(conn)
+        raise
 
 
 def _rollback_quietly(conn: sqlite3.Connection) -> None:
@@ -128,6 +198,17 @@ def _ingest_one(
     path: str = event["path"]
     operation: str = event["operation"]
 
+    # The incoming digest is computed once and used both as the receipt's
+    # verification basis and as the artifact digest.  It is a fixed 64-byte
+    # hex string regardless of how large the package was.
+    content: bytes | None = None
+    media_type: str | None = None
+    digest: str | None = None
+    if operation == "publish":
+        content = event.get("content_bytes") or b""
+        media_type = event.get("media_type") or "application/octet-stream"
+        digest = hashlib.sha256(content).hexdigest()
+
     base = {
         "seq": seq,
         "path": path,
@@ -137,7 +218,8 @@ def _ingest_one(
 
     # A number at or below the GC watermark may already have been reclaimed.
     # Re-sending it must only be acknowledged: applying it again could
-    # resurrect a package withdrawn by a later operation.
+    # resurrect a package withdrawn by a later operation.  The verification
+    # basis was reclaimed with the receipt, so it cannot be compared either.
     if seq <= watermark:
         return {
             **base,
@@ -145,31 +227,102 @@ def _ingest_one(
             "stored": False,
             "applied": False,
             "superseded_by": None,
-            "message": "sequence was already cleaned; acknowledged only",
+            "conflict": None,
+            "content_verified": None,
+            "verification": "not_available",
+            "message": (
+                "sequence was already cleaned; acknowledged only and its "
+                "original content can no longer be verified"
+            ),
         }
 
     existing = conn.execute(
-        "SELECT path, operation FROM receipts WHERE seq = ?", (seq,)
+        "SELECT path, operation, content_sha256 FROM receipts WHERE seq = ?",
+        (seq,),
     ).fetchone()
     if existing is not None:
-        # Exact re-sends are the expected case.  A payload mismatch is still
-        # acknowledged idempotently (first write wins) but surfaced for ops.
-        conflict = existing["path"] != path or existing["operation"] != operation
-        return {
+        # A re-send is acknowledged but never changes state (first write
+        # wins).  Path/operation mismatches are reported exactly as before.
+        # For a publish with the same path and operation we additionally
+        # compare the body against the digest captured when the number was
+        # first received -- even if that first package was superseded or was
+        # later withdrawn, because the receipt keeps its own basis.
+        path_conflict = existing["path"] != path
+        operation_conflict = existing["operation"] != operation
+        duplicate: dict[str, Any] = {
             **base,
             "status": "duplicate",
             "stored": False,
             "applied": False,
             "superseded_by": None,
-            "conflict": conflict,
-            "message": "sequence already received; acknowledged only",
+            "original_path": existing["path"],
+            "original_operation": existing["operation"],
+            "original_sha256": existing["content_sha256"],
+            "received_sha256": digest,
         }
 
+        if path_conflict or operation_conflict:
+            duplicate.update(
+                conflict=True,
+                content_verified=None,
+                verification="not_comparable",
+                message=(
+                    "sequence already received for a different path or "
+                    "operation; acknowledged only"
+                ),
+            )
+        elif operation == "publish":
+            stored_digest = existing["content_sha256"]
+            if stored_digest is None:
+                # The original body is unavailable (for example a legacy
+                # receipt whose package was already withdrawn or replaced
+                # before the upgrade).  Do not guess, and do not let this
+                # resend silently become the new baseline.
+                duplicate.update(
+                    conflict=None,
+                    content_verified=None,
+                    verification="unverifiable",
+                    message=(
+                        "sequence already received, but the original content "
+                        "digest is unavailable; the resend cannot be verified "
+                        "and does not become the original"
+                    ),
+                )
+            elif stored_digest == digest:
+                duplicate.update(
+                    conflict=False,
+                    content_verified=True,
+                    verification="match",
+                    message="sequence already received; identical file re-sent",
+                )
+            else:
+                duplicate.update(
+                    conflict=True,
+                    content_verified=False,
+                    verification="mismatch",
+                    message=(
+                        "sequence already received with different content; "
+                        "acknowledged only, the original file remains in effect"
+                    ),
+                )
+        else:
+            # A delete carries no body, so there is nothing to compare.
+            duplicate.update(
+                conflict=False,
+                content_verified=None,
+                verification="not_applicable",
+                message="sequence already received; acknowledged only",
+            )
+        return duplicate
+
     # Older operations are still receipts even when a newer operation for the
-    # same path wins.  They are needed for contiguous-prefix GC.
+    # same path wins.  They are needed for contiguous-prefix GC.  The digest is
+    # written in this same row/transaction, so it commits or rolls back with
+    # the receipt and is removed with it by GC.
     conn.execute(
-        "INSERT INTO receipts(seq, path, operation, received_at) VALUES (?, ?, ?, ?)",
-        (seq, path, operation, utcnow()),
+        "INSERT INTO receipts(seq, path, operation, content_sha256, received_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (seq, path, operation, digest, utcnow()),
     )
 
     current = conn.execute(
@@ -181,9 +334,9 @@ def _ingest_one(
     if applied:
         now = utcnow()
         if operation == "publish":
-            content: bytes = event.get("content_bytes") or b""
-            media_type = event.get("media_type") or "application/octet-stream"
-            digest = hashlib.sha256(content).hexdigest()
+            content = content if content is not None else b""
+            media_type = media_type or "application/octet-stream"
+            digest = digest or hashlib.sha256(content).hexdigest()
             conn.execute(
                 """
                 INSERT INTO artifacts(
@@ -279,7 +432,7 @@ def list_events(
     try:
         rows = conn.execute(
             """
-            SELECT seq, path, operation, received_at
+            SELECT seq, path, operation, content_sha256, received_at
             FROM receipts
             WHERE seq > ?
             ORDER BY seq

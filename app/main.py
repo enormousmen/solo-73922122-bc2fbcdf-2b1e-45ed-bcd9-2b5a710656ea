@@ -175,6 +175,16 @@ async def ingest_events(request: Request) -> dict[str, Any]:
     download state.  Sequence numbers already reclaimed by GC are acknowledged
     without being applied, which prevents a late resend from resurrecting a
     withdrawn package after a restart.
+
+    A duplicate of a ``publish`` is compared against the content digest
+    captured when that sequence number was *first* received.  Identical
+    content is reported with ``conflict=false``; different content with
+    ``conflict=true``, so an operator can tell a verbatim retry from the wrong
+    package.  The comparison basis is kept on the receipt even after the
+    package is superseded or withdrawn, and is reclaimed together with the
+    receipt.  If a legacy receipt has no digest (its original body was already
+    lost before the upgrade) the result says ``verification="unverifiable"``
+    and the resend is never adopted as the new original.
     """
 
     content_type = request.headers.get("content-type", "")
